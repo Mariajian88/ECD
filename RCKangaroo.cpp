@@ -13,33 +13,6 @@
 #include "utils.h"
 #include "GpuKang.h"
 
-#ifdef _WIN32
-#include <windows.h>
-#endif
-
-void getExeDirectory(char *outPath, size_t outPathLen)
-{
-#ifdef _WIN32
-	GetModuleFileNameA(NULL, outPath, (DWORD)outPathLen);
-	char *lastSlash = strrchr(outPath, '\\');
-	if (lastSlash)
-		*(lastSlash + 1) = '\0';
-#else
-	ssize_t len = readlink("/proc/self/exe", outPath, outPathLen - 1);
-	if (len != -1)
-	{
-		outPath[len] = '\0';
-		char *lastSlash = strrchr(outPath, '/');
-		if (lastSlash)
-			*(lastSlash + 1) = '\0';
-	}
-	else
-	{
-		outPath[0] = '\0';
-	}
-#endif
-}
-
 EcJMP EcJumps1[JMP_CNT];
 EcJMP EcJumps2[JMP_CNT];
 EcJMP EcJumps3[JMP_CNT];
@@ -79,6 +52,9 @@ char gTamesFileName[1024];
 double gMax;
 bool gGenMode; // tames generation mode
 bool gIsOpsLimit;
+
+bool gSaveCheckpoints = false;
+char gCheckpointFileName[256] = {0};
 
 #pragma pack(push, 1)
 struct DBRec
@@ -227,10 +203,32 @@ void CheckNewPoints()
 	PntIndex = 0;
 	csAddPoints.Leave();
 
-	char checkpointPath[512];
-	getExeDirectory(checkpointPath, sizeof(checkpointPath));
-	strcat(checkpointPath, "CHECKPOINTS.TXT");
-	FILE *checkpointFile = fopen(checkpointPath, "a");
+	if (gSaveCheckpoints)
+	{
+		FILE *checkpointFile = fopen(gCheckpointFileName, "a");
+		if (checkpointFile)
+		{
+			for (int i = 0; i < cnt; i++)
+			{
+				DBRec nrec;
+				u8 *p = pPntList2 + i * GPU_DP_SIZE;
+				memcpy(nrec.x, p, 12);
+				memcpy(nrec.d, p + 16, 22);
+				nrec.type = gGenMode ? TAME : p[40];
+
+				char x_str[25], d_str[45];
+				for (int j = 0; j < 12; ++j)
+					sprintf(x_str + j * 2, "%02X", nrec.x[j]);
+				x_str[24] = 0;
+				for (int j = 0; j < 22; ++j)
+					sprintf(d_str + j * 2, "%02X", nrec.d[j]);
+				d_str[44] = 0;
+
+				fprintf(checkpointFile, "%s %s TYPE:%d\n", x_str, d_str, nrec.type);
+			}
+			fclose(checkpointFile);
+		}
+	}
 
 	for (int i = 0; i < cnt; i++)
 	{
@@ -240,26 +238,12 @@ void CheckNewPoints()
 		memcpy(nrec.d, p + 16, 22);
 		nrec.type = gGenMode ? TAME : p[40];
 
-		if (checkpointFile)
-		{
-
-			for (int k = 0; k < 12; ++k)
-				fprintf(checkpointFile, "%02X", nrec.x[k]);
-
-			fprintf(checkpointFile, ": X ");
-
-			fprintf(checkpointFile, "type: %d | d: ", nrec.type);
-			for (int k = 0; k < 22; ++k)
-				fprintf(checkpointFile, "%02X", nrec.d[k]);
-			fprintf(checkpointFile, "\n");
-			fflush(checkpointFile);
-		}
-
 		DBRec *pref = (DBRec *)db.FindOrAddDataBlock((u8 *)&nrec);
 		if (gGenMode)
 			continue;
 		if (pref)
 		{
+			// in db we dont store first 3 bytes so restore them
 			DBRec tmp_pref;
 			memcpy(&tmp_pref, &nrec, 3);
 			memcpy(((u8 *)&tmp_pref) + 3, pref, sizeof(DBRec) - 3);
@@ -269,8 +253,12 @@ void CheckNewPoints()
 			{
 				if (pref->type == TAME)
 					continue;
+
+				// if it's wild, we can find the key from the same type if distances are different
 				if (*(u64 *)pref->d == *(u64 *)nrec.d)
 					continue;
+				// else
+				//	ToLog("key found by same wild");
 			}
 
 			EcInt w, t;
@@ -298,14 +286,12 @@ void CheckNewPoints()
 				WildType = nrec.type;
 			}
 
-			bool res = Collision_SOTA(gPntToSolve, t, TameType, w, WildType, false) ||
-					   Collision_SOTA(gPntToSolve, t, TameType, w, WildType, true);
+			bool res = Collision_SOTA(gPntToSolve, t, TameType, w, WildType, false) || Collision_SOTA(gPntToSolve, t, TameType, w, WildType, true);
 			if (!res)
 			{
-				bool w12 = ((pref->type == WILD1) && (nrec.type == WILD2)) ||
-						   ((pref->type == WILD2) && (nrec.type == WILD1));
-				if (w12)
-					; // ToLog("W1 and W2 collides in mirror");
+				bool w12 = ((pref->type == WILD1) && (nrec.type == WILD2)) || ((pref->type == WILD2) && (nrec.type == WILD1));
+				if (w12) // in rare cases WILD and WILD2 can collide in mirror, in this case there is no way to find K
+					;	 // ToLog("W1 and W2 collides in mirror");
 				else
 				{
 					printf("Collision Error\r\n");
@@ -317,8 +303,6 @@ void CheckNewPoints()
 			break;
 		}
 	}
-	if (checkpointFile)
-		fclose(checkpointFile);
 }
 
 void ShowStats(u64 tm_start, double exp_ops, double dp_val)
@@ -363,7 +347,7 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt *pk_res)
 		printf("Unsupported Range value (%d)!\r\n", Range);
 		return false;
 	}
-	if ((DP < 14) || (DP > 60))
+	if ((DP < 13) || (DP > 60))
 	{
 		printf("Unsupported DP value (%d)!\r\n", DP);
 		return false;
@@ -510,6 +494,8 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt *pk_res)
 		}
 	}
 
+	CheckNewPoints(); // ####################################################
+
 	printf("Stopping work ...\r\n");
 	for (int i = 0; i < GpuCnt; i++)
 		GpuKangs[i]->Stop();
@@ -573,11 +559,15 @@ bool ParseCommandLine(int argc, char *argv[])
 				gGPUs_Mask[gpus[i] - '0'] = 1;
 			}
 		}
+		else if (strcmp(argument, "-cpoint") == 0)
+		{
+			gSaveCheckpoints = true;
+		}
 		else if (strcmp(argument, "-dp") == 0)
 		{
 			int val = atoi(argv[ci]);
 			ci++;
-			if ((val < 14) || (val > 60))
+			if ((val < 13) || (val > 60))
 			{
 				printf("error: invalid value for -dp option\r\n");
 				return false;
@@ -661,7 +651,7 @@ int main(int argc, char *argv[])
 #endif
 
 	printf("********************************************************************************\r\n");
-	printf("*                    RCKangaroo v3.0  (c) 2024 RetiredCoder                    *\r\n");
+	printf("*                      Kangaroo v3.1  (c) 2025  Spectrud                       *\r\n");
 	printf("********************************************************************************\r\n\r\n");
 
 	printf("This software is free and open-source: https://github.com/RetiredC\r\n");
@@ -686,6 +676,7 @@ int main(int argc, char *argv[])
 	gGenMode = false;
 	gIsOpsLimit = false;
 	memset(gGPUs_Mask, 1, sizeof(gGPUs_Mask));
+
 	if (!ParseCommandLine(argc, argv))
 		return 0;
 
@@ -695,6 +686,40 @@ int main(int argc, char *argv[])
 	{
 		printf("No supported GPUs detected, exit\r\n");
 		return 0;
+	}
+
+	if (gSaveCheckpoints)
+	{
+		std::string params;
+		for (int i = 1; i < argc; ++i)
+		{
+			if (strcmp(argv[i], "-dp") == 0 ||
+				strcmp(argv[i], "-range") == 0 ||
+				strcmp(argv[i], "-start") == 0 ||
+				strcmp(argv[i], "-pubkey") == 0)
+			{
+				if (!params.empty())
+					params += " ";
+				params += argv[i];
+				if ((i + 1) < argc)
+				{
+					params += " ";
+					params += argv[i + 1];
+					++i;
+				}
+			}
+		}
+		time_t now = time(0);
+		struct tm *t = localtime(&now);
+		sprintf(gCheckpointFileName, "CHECKPOINTS.%04d%02d%02d_%02d%02d%02d.TXT",
+				t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+				t->tm_hour, t->tm_min, t->tm_sec);
+		FILE *f = fopen(gCheckpointFileName, "w");
+		if (f)
+		{
+			fprintf(f, "%s\n", params.c_str());
+			fclose(f);
+		}
 	}
 
 	pPntList = (u8 *)malloc(MAX_CNT_LIST * GPU_DP_SIZE);
