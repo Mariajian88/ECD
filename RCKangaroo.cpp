@@ -492,8 +492,6 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt *pk_res)
 		}
 	}
 
-	CheckNewPoints(); // ####################################################
-
 	printf("Stopping work ...\r\n");
 	for (int i = 0; i < GpuCnt; i++)
 		GpuKangs[i]->Stop();
@@ -688,51 +686,9 @@ int main(int argc, char *argv[])
 
 	if (gSaveCheckpoints)
 	{
-		std::string params;
-		for (int i = 1; i < argc; ++i)
-		{
-			if (strcmp(argv[i], "-dp") == 0 ||
-				strcmp(argv[i], "-range") == 0 ||
-				strcmp(argv[i], "-start") == 0 ||
-				strcmp(argv[i], "-pubkey") == 0)
-			{
-				if (!params.empty())
-					params += " ";
-				params += argv[i];
-				if ((i + 1) < argc)
-				{
-					params += " ";
-					params += argv[i + 1];
-					++i;
-				}
-			}
-		}
-
-		bool needRewrite = true;
-		FILE *f = fopen("CHECKPOINTS.TXT", "r");
+		FILE *f = fopen("CHECKPOINTS.TXT", "w");
 		if (f)
-		{
-			char firstLine[2048] = {0};
-			if (fgets(firstLine, sizeof(firstLine), f))
-			{
-				size_t len = strlen(firstLine);
-				while (len > 0 && (firstLine[len - 1] == '\n' || firstLine[len - 1] == '\r'))
-					firstLine[--len] = 0;
-
-				if (params == firstLine)
-					needRewrite = false;
-			}
 			fclose(f);
-		}
-		if (needRewrite)
-		{
-			f = fopen("CHECKPOINTS.TXT", "w");
-			if (f)
-			{
-				fprintf(f, "%s\n", params.c_str());
-				fclose(f);
-			}
-		}
 	}
 
 	pPntList = (u8 *)malloc(MAX_CNT_LIST * GPU_DP_SIZE);
